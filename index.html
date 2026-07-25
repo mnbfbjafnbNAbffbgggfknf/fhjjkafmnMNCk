@@ -2315,10 +2315,10 @@ function seedDefaultLosses(){
       updated_at: new Date().toISOString(),
     };
     state.losses.push(row);
-    state.pendingOps.push({ table:'losses', action:'upsert', data: row });
+    queueOp({ table:'losses', action:'upsert', data: row });
   });
   console.info('Seeded', DEFAULT_LOSSES.length, 'default loss types');
-  trySync();
+  persist();
 }
 
 // ============================================================
