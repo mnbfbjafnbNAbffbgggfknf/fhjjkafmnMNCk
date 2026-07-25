@@ -919,6 +919,7 @@ body.lightbg .admin-btn{
   .kpi .val{font-size:18px}
 }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -2795,6 +2796,7 @@ function renderDash(opts){
     {key:'losses',     label:'⚠ Loss Types', feature:'loss_types_mgmt'},
     {key:'vehicles',   label:'Vehicles'},
     {key:'managers',   label:'Managers'},
+    {key:'import',     label:'⬆ Bulk Import'},
     {key:'custom',     label:'Custom Fields'},
     {key:'export',     label:'Export'},
     {key:'audit',      label:'Audit Log'},
@@ -2859,6 +2861,7 @@ function renderDash(opts){
     else if(state.activeTab==='losses') renderLossTypes(page);
     else if(state.activeTab==='vehicles') renderVehicles(page);
     else if(state.activeTab==='managers') renderManagers(page);
+    else if(state.activeTab==='import') renderBulkImport(page);
     else if(state.activeTab==='custom') renderCustomFields(page);
     else if(state.activeTab==='export') renderExport(page);
     else if(state.activeTab==='audit') renderAudit(page);
@@ -5976,6 +5979,249 @@ function renderAudit(page){
     </div>
   `;
 }
+
+// ============================================================
+// OWNER: BULK IMPORT (CSV) — Vehicles, Managers, Entries
+// ============================================================
+
+// Minimal CSV parser — handles quoted fields with embedded commas/newlines.
+function parseCSV(text){
+  const rows = []; let row = []; let field = ''; let inQuotes = false;
+  text = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  for(let i=0;i<text.length;i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i++; } else { inQuotes = false; }
+      } else field += c;
+    } else {
+      if(c === '"') inQuotes = true;
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else field += c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  // Drop trailing fully-empty rows
+  while(rows.length && rows[rows.length-1].every(f=>f.trim()==='')) rows.pop();
+  if(!rows.length) return {headers:[], rows:[]};
+  const headers = rows[0].map(h=>h.trim().toLowerCase());
+  const dataRows = rows.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h,i)=> obj[h] = (r[i]||'').trim());
+    return obj;
+  });
+  return {headers, rows:dataRows};
+}
+
+function downloadTextFile(filename, text){
+  const blob = new Blob([text], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+}
+
+// Parses an .xlsx/.xls ArrayBuffer into the same {headers, rows} shape as
+// parseCSV, so both formats feed the same validation/preview/import code.
+function parseXLSXArrayBuffer(buf){
+  const wb = XLSX.read(buf, {type:'array', cellDates:true});
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:''});
+  while(aoa.length && aoa[aoa.length-1].every(f=>String(f).trim()==='')) aoa.pop();
+  if(!aoa.length) return {headers:[], rows:[]};
+  const headers = aoa[0].map(h=>String(h).trim().toLowerCase());
+  const dataRows = aoa.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h,i) => {
+      let v = r[i]; if(v === undefined) v = '';
+      if(v instanceof Date) v = formatDateForImport(v);
+      obj[h] = String(v).trim();
+    });
+    return obj;
+  });
+  return {headers, rows:dataRows};
+}
+function formatDateForImport(d){
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Builds a simple, professional .xlsx sample workbook client-side (via
+// SheetJS) with an instruction row, header row, and one example data row.
+function downloadXLSXSample(kind){
+  if(typeof XLSX === 'undefined'){ toast('Excel support failed to load — check your internet connection', 'err'); return; }
+  const t = BULK_TEMPLATES[kind];
+  const headers = t.header.split(',');
+  const aoa = [ [t.instructions], headers, t.exampleRow ];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:headers.length-1} }];
+  ws['!cols'] = headers.map(()=>({wch:18}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Import');
+  XLSX.writeFile(wb, t.filename.replace('.csv','.xlsx'));
+}
+
+const BULK_TEMPLATES = {
+  vehicles: {
+    filename: 'vehicles_sample.csv',
+    header: 'name,reg_no,branch,type',
+    sample: 'name,reg_no,branch,type\nDumper 1,CG04AB1234,SHAHPURA,vehicle\nTanker 2,CG04CD5678,BANDOL,vehicle\n',
+    instructions: "Fill one row per vehicle/machine. Columns: name, reg_no, branch (location, e.g. SHAHPURA), type (vehicle or machine — defaults to vehicle if blank). Delete/replace the example row before uploading.",
+    exampleRow: ['Dumper 1','CG04AB1234','SHAHPURA','vehicle'],
+  },
+  managers: {
+    filename: 'managers_sample.csv',
+    header: 'slot,name,password',
+    sample: 'slot,name,password\n1,Ramesh Kumar,1111\n2,Suresh Yadav,2222\n',
+    instructions: "Fill one row per Diesel Manager. 'slot' must be 1-10 (10 slots per company). Delete/replace the example row before uploading.",
+    exampleRow: [1,'Ramesh Kumar','1111'],
+  },
+  entries: {
+    filename: 'entries_sample.csv',
+    header: 'vehicle,quantity,fill_time,source,hmr,manager_name',
+    sample: 'vehicle,quantity,fill_time,source,hmr,manager_name\nCG04AB1234,45.5,2026-07-01 09:30,pump,1234,Ramesh Kumar\nDumper 1,60,2026-07-02 14:00,bowser_a,,Suresh Yadav\n',
+    instructions: "'vehicle' must match an existing vehicle's name/reg_no. fill_time format: YYYY-MM-DD HH:MM. hmr and manager_name are optional.",
+    exampleRow: ['CG04AB1234',45.5,'2026-07-01 09:30','pump',1234,'Ramesh Kumar'],
+  },
+};
+
+let _bulkParsed = { vehicles:null, managers:null, entries:null };
+
+function renderBulkImport(page){
+  const section = (kind, title, desc) => `
+    <div class="section">
+      <div class="section-h"><h3>${title}</h3></div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">${desc}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <button class="btn small ghost" onclick="downloadBulkSample('${kind}')">⬇ Sample CSV</button>
+        <button class="btn small ghost" onclick="downloadXLSXSample('${kind}')">⬇ Sample Excel (.xlsx)</button>
+        <input type="file" accept=".csv,.xlsx,.xls" id="bulk-file-${kind}" style="max-width:240px">
+        <button class="btn small primary" onclick="handleBulkParse('${kind}')">Preview</button>
+      </div>
+      <div id="bulk-preview-${kind}"></div>
+    </div>`;
+  page.innerHTML =
+    section('vehicles', 'Import Vehicles', 'Columns: <code>name, reg_no, branch, type</code>. <b>branch</b> is the location (e.g. SHAHPURA), <b>type</b> is <code>vehicle</code> or <code>machine</code> (defaults to vehicle). Existing vehicles are not duplicated by name match.') +
+    section('managers', 'Import Managers', 'Columns: <code>slot, name, password</code>. Slot must be 1–10 (there are only 10 manager slots per company — this updates that slot and activates it).') +
+    section('entries', 'Import Fuel Entries', 'Columns: <code>vehicle, quantity, fill_time, source, hmr, manager_name</code>. <b>vehicle</b> is matched against reg_no or name. <b>fill_time</b> format: <code>YYYY-MM-DD HH:MM</code>. <b>hmr</b> and <b>manager_name</b> are optional.');
+}
+
+function downloadBulkSample(kind){
+  const t = BULK_TEMPLATES[kind];
+  downloadTextFile(t.filename, t.sample);
+}
+
+function handleBulkParse(kind){
+  const input = $('#bulk-file-'+kind);
+  const file = input && input.files && input.files[0];
+  if(!file){ toast('Choose a file first', 'err'); return; }
+  const isExcel = /\.xlsx?$/i.test(file.name);
+  const reader = new FileReader();
+  reader.onload = () => {
+    let headers, rows;
+    try{
+      if(isExcel){
+        if(typeof XLSX === 'undefined'){ toast('Excel support failed to load — check your internet connection and retry', 'err'); return; }
+        ({headers, rows} = parseXLSXArrayBuffer(reader.result));
+      } else {
+        ({headers, rows} = parseCSV(reader.result));
+      }
+    }catch(e){ toast('Could not parse file: '+e.message, 'err'); return; }
+    const {rows: validated, errCount} = validateBulkRows(kind, headers, rows);
+    _bulkParsed[kind] = validated;
+    renderBulkPreview(kind, validated, errCount);
+  };
+  reader.onerror = () => toast('Could not read file', 'err');
+  if(isExcel) reader.readAsArrayBuffer(file); else reader.readAsText(file);
+}
+
+function validateBulkRows(kind, headers, rows){
+  let errCount = 0;
+  const validated = rows.map((r, idx) => {
+    const errors = [];
+    if(kind === 'vehicles'){
+      if(!r.name && !r.reg_no) errors.push('name or reg_no required');
+    } else if(kind === 'managers'){
+      const slot = parseInt(r.slot);
+      if(!slot || slot < 1 || slot > 10) errors.push('slot must be 1-10');
+      if(!r.name) errors.push('name required');
+      if(!r.password) errors.push('password required');
+    } else if(kind === 'entries'){
+      if(!r.vehicle) errors.push('vehicle required');
+      const qty = parseFloat(r.quantity);
+      if(!qty || qty <= 0) errors.push('quantity must be a positive number');
+      const dt = r.fill_time ? new Date(r.fill_time.replace(' ','T')) : null;
+      if(!dt || isNaN(dt.getTime())) errors.push('fill_time invalid (use YYYY-MM-DD HH:MM)');
+      else r._parsedTime = dt.toISOString();
+      if(r.vehicle){
+        const veh = state.vehicles.find(v =>
+          (v.reg_no||'').toLowerCase() === r.vehicle.toLowerCase() ||
+          (v.name||'').toLowerCase() === r.vehicle.toLowerCase());
+        if(!veh) errors.push('vehicle not found: '+r.vehicle);
+        else r._vehicleId = veh.id;
+      }
+    }
+    if(errors.length) errCount++;
+    return {...r, _row: idx+2, _errors: errors};
+  });
+  return {rows: validated, errCount};
+}
+
+function renderBulkPreview(kind, rows, errCount){
+  const el = $('#bulk-preview-'+kind);
+  if(!rows.length){ el.innerHTML = '<div class="empty" style="padding:12px">No rows found in file.</div>'; return; }
+  const cols = Object.keys(rows[0]).filter(k => !k.startsWith('_'));
+  el.innerHTML = `
+    <div style="font-size:12px;margin:8px 0">
+      ${rows.length} row(s) found — ${errCount ? `<span style="color:var(--danger)">${errCount} with errors (will be skipped)</span>` : `<span style="color:var(--success)">all valid</span>`}
+    </div>
+    <div class="table-wrap" style="max-height:260px;overflow:auto"><table>
+      <thead><tr>${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join('')}<th>Status</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `<tr style="${r._errors.length?'background:#fef2f2':''}">
+          ${cols.map(c=>`<td>${escapeHtml(String(r[c]||''))}</td>`).join('')}
+          <td>${r._errors.length ? '<span style="color:var(--danger)">'+escapeHtml(r._errors.join('; '))+'</span>' : '<span style="color:var(--success)">OK</span>'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div>
+    <button class="btn primary" style="margin-top:10px" onclick="handleBulkImport('${kind}')" ${rows.every(r=>r._errors.length) ? 'disabled':''}>
+      Import ${rows.filter(r=>!r._errors.length).length} valid row(s)
+    </button>`;
+}
+
+function handleBulkImport(kind){
+  const rows = (_bulkParsed[kind] || []).filter(r => !r._errors.length);
+  if(!rows.length){ toast('No valid rows to import', 'err'); return; }
+  if(!confirm(`Import ${rows.length} ${kind}? This writes directly to your company's data.`)) return;
+
+  if(kind === 'vehicles'){
+    rows.forEach(r => addVehicle({
+      name: r.name || r.reg_no, reg_no: r.reg_no || '',
+      branch: r.branch || '', type: (r.type||'').toLowerCase()==='machine' ? 'machine' : 'vehicle',
+      active:true,
+    }));
+  } else if(kind === 'managers'){
+    rows.forEach(r => updateManager(parseInt(r.slot), { name:r.name, password:r.password, active:true }));
+  } else if(kind === 'entries'){
+    rows.forEach(r => addEntry({
+      manager_id: null, manager_name: r.manager_name || 'Bulk Import',
+      vehicle_id: r._vehicleId, vehicle_name: r.vehicle,
+      hmr: r.hmr ? parseFloat(r.hmr) : null,
+      quantity: parseFloat(r.quantity), fill_time: r._parsedTime,
+      source: r.source || 'manual', source_custom:'', custom_data:{},
+      fill_type:'bulk_import', stock:null,
+    }));
+  }
+  toast(`Imported ${rows.length} ${kind}`, 'ok');
+  _bulkParsed[kind] = null;
+  renderDash({auto:true});
+}
+window.downloadBulkSample = downloadBulkSample;
+window.downloadXLSXSample = downloadXLSXSample;
+window.handleBulkParse = handleBulkParse;
+window.handleBulkImport = handleBulkImport;
 
 // ---------- OWNER: SETTINGS ----------
 function renderSettings(page){
