@@ -6031,8 +6031,16 @@ function parseXLSXArrayBuffer(buf){
   const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:''});
   while(aoa.length && aoa[aoa.length-1].every(f=>String(f).trim()==='')) aoa.pop();
   if(!aoa.length) return {headers:[], rows:[]};
-  const headers = aoa[0].map(h=>String(h).trim().toLowerCase());
-  const dataRows = aoa.slice(1).map(r => {
+  // Skip any leading "instruction banner" rows (like our own sample templates
+  // have) — recognized as a row with only 1 non-empty cell. The real header
+  // row is the first one with more than one filled cell.
+  let headerIdx = 0;
+  while(headerIdx < aoa.length - 1 &&
+        aoa[headerIdx].filter(c => String(c).trim() !== '').length <= 1){
+    headerIdx++;
+  }
+  const headers = aoa[headerIdx].map(h=>String(h).trim().toLowerCase());
+  const dataRows = aoa.slice(headerIdx+1).map(r => {
     const obj = {};
     headers.forEach((h,i) => {
       let v = r[i]; if(v === undefined) v = '';
@@ -7516,6 +7524,7 @@ setInterval(()=>{ if(state.online) trySync(); }, 15000);
 </script>
 </body>
 </html>
+
 
 
 
