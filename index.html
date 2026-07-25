@@ -918,6 +918,16 @@ body.lightbg .admin-btn{
   .section{padding:12px}
   .kpi .val{font-size:18px}
 }
+@media print{
+  body{ background:#fff !important; }
+  .topbar, .tabbar, #fab, .role-tabs, #login-screen, .btn{ display:none !important; }
+  #dash-screen{ background:#fff !important; }
+  .page{ padding:0 !important; }
+  .section{ box-shadow:none !important; border:1px solid #ddd !important; }
+  .fleet-report-vehicle-block{ break-before:page; page-break-before:always; }
+  .fleet-report-vehicle-block:first-of-type{ break-before:auto; page-break-before:auto; }
+  a[href^="#fr-"]{ display:none !important; }
+}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
@@ -2751,6 +2761,24 @@ function addIncident(row){
   persist();
   queueOp({table:'driver_incidents', action:'upsert', data: row});
 }
+// Admin edit — re-denormalizes loss_label/category/severity from the (possibly
+// changed) loss_id, same as addIncident does on create.
+function updateIncident(id, patch){
+  const i = state.incidents.findIndex(x => x.id === id);
+  if(i < 0) return;
+  const next = {...state.incidents[i], ...patch, updated_at:new Date().toISOString()};
+  if(patch.loss_id){
+    const loss = state.losses.find(l => l.id === patch.loss_id);
+    if(loss){
+      next.loss_label = loss.label;
+      next.loss_category = loss.category;
+      next.loss_severity = loss.severity;
+    }
+  }
+  state.incidents[i] = next;
+  persist();
+  queueOp({table:'driver_incidents', action:'upsert', data: next});
+}
 function deleteIncident(id){
   state.incidents = state.incidents.filter(x => x.id !== id);
   persist();
@@ -2792,6 +2820,7 @@ function renderDash(opts){
     {key:'entries',    label:'All Entries'},
     {key:'reports',    label:'Reports'},
     {key:'analysis',   label:'Analysis'},
+    {key:'fleetreport',label:'📈 Mileage Report'},
     {key:'incidents',  label:'👤 Drivers', feature:'driver_timeline'},
     {key:'losses',     label:'⚠ Loss Types', feature:'loss_types_mgmt'},
     {key:'vehicles',   label:'Vehicles'},
@@ -2857,6 +2886,7 @@ function renderDash(opts){
     else if(state.activeTab==='entries') renderAllEntries(page);
     else if(state.activeTab==='reports') renderReports(page);
     else if(state.activeTab==='analysis') renderVehicleAnalysis(page);
+    else if(state.activeTab==='fleetreport') renderFleetReport(page);
     else if(state.activeTab==='incidents') renderDriverIncidents(page);
     else if(state.activeTab==='losses') renderLossTypes(page);
     else if(state.activeTab==='vehicles') renderVehicles(page);
@@ -3995,7 +4025,84 @@ window.setDateFilterPreset = function(p){
   if(window._refilterAllEntries) window._refilterAllEntries();
 };
 
-// ---------- OWNER: VEHICLE ANALYSIS ----------
+// ---------- OWNER: FLEET MILEAGE REPORT (all vehicles, one after another) ----------
+function renderFleetReport(page){
+  const activeVehicles = state.vehicles.filter(v => v.active !== false)
+    .slice().sort((a,b) => (a.reg_no||a.name||'').localeCompare(b.reg_no||b.name||''));
+  if(!activeVehicles.length){
+    page.innerHTML = `<div class="section"><div class="empty"><div class="em">🚜</div>No vehicles available. Add vehicles in the Vehicles tab first.</div></div>`;
+    return;
+  }
+  const withStats = activeVehicles.map(veh => {
+    const stats = computeVehicleStats(veh.id);
+    const flagged = stats.f2fPoints
+      .map(p => ({ point:p, anomaly: detectAnomaly(p.entry) }))
+      .filter(x => x.anomaly);
+    return { veh, stats, flagged };
+  });
+  const flaggedCount = withStats.filter(x => x.flagged.length > 0).length;
+
+  page.innerHTML = `
+    <div class="section" id="fleet-report-header">
+      <div class="section-h">
+        <h3>📈 Fleet Mileage Report</h3>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="sub">${activeVehicles.length} vehicle(s) · ${flaggedCount} with flagged anomalies</span>
+          <button class="btn small ghost" onclick="window.print()">🖨 Print / Save as PDF</button>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text-muted)">Mileage trend for every active vehicle, followed by its flagged anomalies (or a clean "no anomalies" note). Jump to a vehicle: 
+        ${withStats.map(x=>`<a href="#fr-${x.veh.id}" style="margin-right:8px">${escapeHtml(x.veh.reg_no||x.veh.name)}${x.flagged.length?' ⚠':''}</a>`).join('')}
+      </div>
+    </div>
+    ${withStats.map(({veh, stats, flagged}) => {
+      const vehIcon = veh.type === 'machine' ? '⚙️' : '🚛';
+      const vehTypeLabel = veh.type === 'machine' ? 'Machine' : 'Vehicle';
+      return `
+        <div class="section fleet-report-vehicle-block" id="fr-${veh.id}" style="margin-top:18px;border-top:3px solid var(--accent)">
+          <div class="section-h">
+            <h3>${vehIcon} ${escapeHtml(veh.reg_no || veh.name)}</h3>
+            <span class="sub">
+              ${veh.name && veh.name !== veh.reg_no ? escapeHtml(veh.name)+' · ' : ''}${vehTypeLabel}${veh.branch ? ' · 📍 '+escapeHtml(veh.branch) : ''}
+            </span>
+          </div>
+        </div>
+        ${renderMileageChart(veh, stats, {includeSegmentBars:false})}
+        ${renderVehicleAnomaliesList(veh, stats, flagged)}
+      `;
+    }).join('')}
+  `;
+}
+
+// Compact list of only the flagged (anomalous) Full-to-Full fills for one vehicle.
+function renderVehicleAnomaliesList(veh, stats, flagged){
+  flagged = flagged || stats.f2fPoints
+    .map(p => ({ point:p, anomaly: detectAnomaly(p.entry) }))
+    .filter(x => x.anomaly);
+  if(!flagged.length){
+    return `<div class="section" style="margin-top:8px">
+      <div class="section-h"><h3>⚠ Flagged Anomalies</h3></div>
+      <div class="empty" style="padding:14px"><div class="em">✅</div>No anomalies flagged for this vehicle.</div>
+    </div>`;
+  }
+  const unit = stats.isMachine ? 'L/hr' : 'km/L';
+  return `<div class="section" style="margin-top:8px">
+    <div class="section-h"><h3>⚠ Flagged Anomalies</h3><span class="sub">${flagged.length} fill(s)</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Mileage</th><th>Baseline</th><th>Deviation</th><th>Severity</th></tr></thead>
+      <tbody>
+        ${flagged.map(({point,anomaly}) => `
+          <tr class="row-anomaly-${anomaly.severity}">
+            <td>${new Date(point.date).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'2-digit'})}</td>
+            <td>${point.value.toFixed(2)} ${unit}</td>
+            <td>${anomaly.baseline.toFixed(2)} ${unit}</td>
+            <td>${anomaly.deviation>0?'+':''}${anomaly.deviation.toFixed(0)}%</td>
+            <td><span class="badge ${anomaly.severity==='critical'?'off':anomaly.severity==='high'?'warn':'info'}">${anomaly.severity}</span></td>
+          </tr>`).join('')}
+      </tbody>
+    </table></div>
+  </div>`;
+}
 function renderVehicleAnalysis(page){
   const activeVehicles = state.vehicles.filter(v => v.active !== false);
   if(activeVehicles.length === 0){
@@ -4196,7 +4303,9 @@ function renderVehicleStatsCards(veh, stats){
   `;
 }
 
-function renderMileageChart(veh, stats){
+function renderMileageChart(veh, stats, opts){
+  opts = opts || {};
+  const includeSegmentBars = opts.includeSegmentBars !== false;
   const unit = stats.isMachine ? 'L/hr' : 'km/L';
   const pts = stats.f2fPoints;
   if(pts.length < 2){
@@ -4304,7 +4413,7 @@ function renderMileageChart(veh, stats){
         <span style="color:var(--text-soft)">💡 Hover a point for date + diesel + ${stats.isMachine?'hrs':'km'}</span>
       </div>
 
-      ${renderGroupedSegmentBars(pts, stats)}
+      ${includeSegmentBars ? renderGroupedSegmentBars(pts, stats) : ''}
     </div>
   `;
 }
@@ -4492,7 +4601,10 @@ function renderVehicleEntryLog(veh, stats){
 }
 
 // ---------- OWNER: VEHICLES ----------
+let _vehicleBulkSelected = new Set();
+
 function renderVehicles(page){
+  _vehicleBulkSelected = new Set(); // reset selection on every render
   const all = state.vehicles.slice();
   // Stable sort by reg_no — gives consistent serial numbering
   all.sort((a,b) => (a.reg_no||a.name||'').localeCompare(b.reg_no||b.name||''));
@@ -4507,6 +4619,7 @@ function renderVehicles(page){
     const clickable   = isFeatureEnabled('vehicle_clickable');
     return `<div class="table-wrap"><table>
       <thead><tr>
+        <th style="width:32px"><input type="checkbox" class="veh-select-all" data-kind="${kind}" onchange="toggleVehicleSelectAll(this,'${kind}')"></th>
         <th style="width:50px">S.No</th>
         <th>Reg No</th>
         <th>Type</th>
@@ -4518,6 +4631,7 @@ function renderVehicles(page){
       </tr></thead>
       <tbody>${list.map((v, idx)=>`
         <tr>
+          <td><input type="checkbox" class="veh-select" data-kind="${kind}" data-id="${v.id}" onchange="toggleVehicleSelect('${v.id}',this.checked)"></td>
           <td><span class="serial-no">${idx+1}</span></td>
           <td>${clickable
               ? `<a href="#" class="vehicle-link" onclick="event.preventDefault();openVehicleAnalysis('${v.id}')" title="View consumption analysis"><b style="${v.gps_enabled?'color:#059669':''}">${escapeHtml(v.reg_no||'—')}</b></a>`
@@ -4544,6 +4658,12 @@ function renderVehicles(page){
           <button class="btn small" onclick="addVehicleModal()">+ Add</button>
         </div>
       </div>
+      <div id="veh-bulk-toolbar" style="display:none;align-items:center;gap:10px;padding:10px 12px;background:#ecfeff;border:1px solid #67e8f9;border-radius:var(--radius-sm);margin-bottom:12px">
+        <span id="veh-bulk-count" style="font-size:13px;font-weight:600;color:var(--accent-dark)"></span>
+        <button class="btn small" onclick="bulkSetGps(true)"><i class="ti ti-satellite" style="vertical-align:-2px"></i> Enable GPS</button>
+        <button class="btn small ghost" onclick="bulkSetGps(false)">Disable GPS</button>
+        <button class="btn small ghost" onclick="clearVehicleSelection()">Clear selection</button>
+      </div>
       ${state.vehicles.length===0
         ? `<div class="empty">
             <div class="em">🚜</div>
@@ -4561,6 +4681,40 @@ function renderVehicles(page){
     </div>
   `;
 }
+
+function updateVehicleBulkToolbar(){
+  const bar = $('#veh-bulk-toolbar');
+  if(!bar) return;
+  const n = _vehicleBulkSelected.size;
+  bar.style.display = n > 0 ? 'flex' : 'none';
+  const countEl = $('#veh-bulk-count');
+  if(countEl) countEl.textContent = n + ' vehicle' + (n===1?'':'s') + ' selected';
+}
+window.toggleVehicleSelect = function(id, checked){
+  if(checked) _vehicleBulkSelected.add(id); else _vehicleBulkSelected.delete(id);
+  updateVehicleBulkToolbar();
+};
+window.toggleVehicleSelectAll = function(checkbox, kind){
+  $$(`.veh-select[data-kind="${kind}"]`).forEach(cb => {
+    cb.checked = checkbox.checked;
+    if(checkbox.checked) _vehicleBulkSelected.add(cb.dataset.id);
+    else _vehicleBulkSelected.delete(cb.dataset.id);
+  });
+  updateVehicleBulkToolbar();
+};
+window.clearVehicleSelection = function(){
+  _vehicleBulkSelected.clear();
+  $$('.veh-select, .veh-select-all').forEach(cb => cb.checked = false);
+  updateVehicleBulkToolbar();
+};
+window.bulkSetGps = function(enable){
+  const ids = Array.from(_vehicleBulkSelected);
+  if(!ids.length) return;
+  if(!confirm(`${enable?'Enable':'Disable'} GPS for ${ids.length} selected vehicle(s)?`)) return;
+  ids.forEach(id => updateVehicle(id, {gps_enabled: enable}));
+  toast(`GPS ${enable?'enabled':'disabled'} for ${ids.length} vehicle(s)`, 'ok');
+  renderDash({auto:true});
+};
 
 window.addVehicleModal = function(){
   openModal('Add Vehicle / Machine', `
@@ -6111,10 +6265,121 @@ function renderBulkImport(page){
       <div id="bulk-preview-${kind}"></div>
     </div>`;
   page.innerHTML =
-    section('vehicles', 'Import Vehicles', 'Columns: <code>name, reg_no, branch, type</code>. <b>branch</b> is the location (e.g. SHAHPURA), <b>type</b> is <code>vehicle</code> or <code>machine</code> (defaults to vehicle). Existing vehicles are not duplicated by name match.') +
+    section('vehicles', 'Import Vehicles', 'Columns: <code>name, reg_no, branch, type</code>. <b>branch</b> is the location (e.g. SHAHPURA), <b>type</b> is <code>vehicle</code> or <code>machine</code> (defaults to vehicle). Rows matching an existing vehicle by name/reg_no are skipped as duplicates.') +
     section('managers', 'Import Managers', 'Columns: <code>slot, name, password</code>. Slot must be 1–10 (there are only 10 manager slots per company — this updates that slot and activates it).') +
-    section('entries', 'Import Fuel Entries', 'Columns: <code>vehicle, quantity, fill_time, source, hmr, manager_name</code>. <b>vehicle</b> is matched against reg_no or name. <b>fill_time</b> format: <code>YYYY-MM-DD HH:MM</code>. <b>hmr</b> and <b>manager_name</b> are optional.');
+    section('entries', 'Import Fuel Entries', 'Columns: <code>vehicle, quantity, fill_time, source, hmr, manager_name</code>. <b>vehicle</b> is matched against reg_no or name. <b>fill_time</b> format: <code>YYYY-MM-DD HH:MM</code>. <b>hmr</b> and <b>manager_name</b> are optional. All imported entries are marked <b>Full Tank</b> by default — edit an entry afterward (All Entries → click entry → Edit) to mark it Not Full if needed. Rows matching the same vehicle+time+quantity as an existing entry are skipped as duplicates.') +
+    `<div class="section" id="dup-cleanup-section">
+      <div class="section-h"><h3>🧹 Find &amp; Remove Duplicate Entries</h3></div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+        Scans all synced entries for this company and finds groups with the same vehicle + fill time (to the minute) + quantity — usually caused by uploading the same file twice. Keeps the oldest entry in each group and removes the rest.
+      </div>
+      <button class="btn small ghost" onclick="scanDuplicateEntries()">🔍 Scan for duplicates</button>
+      <div id="dup-scan-result" style="margin-top:10px"></div>
+    </div>
+
+    <div class="section" id="fix-filltype-section">
+      <div class="section-h"><h3>✅ Mark Bulk-Imported Entries as Full Tank</h3></div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+        Entries imported before the Full Tank default was added may be missing a valid Fill Type, which breaks mileage/F2F calculations. This finds those and marks them Full Tank (you can still edit individual entries back to Not Full afterward).
+      </div>
+      <button class="btn small ghost" onclick="scanBadFillType()">🔍 Scan entries</button>
+      <div id="filltype-scan-result" style="margin-top:10px"></div>
+    </div>`;
 }
+
+function scanBadFillType(){
+  const bad = state.entries.filter(e => e.fill_type !== 'full' && e.fill_type !== 'not_full');
+  _badFillTypeEntries = bad;
+  const el = $('#filltype-scan-result');
+  if(!bad.length){
+    el.innerHTML = '<div style="color:var(--success);font-size:13px">All entries already have a valid Fill Type.</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div style="font-size:13px;margin-bottom:8px;color:var(--warn)">
+      Found ${bad.length} entr${bad.length===1?'y':'ies'} with an invalid/missing Fill Type (current value shown below).
+    </div>
+    <div class="table-wrap" style="max-height:220px;overflow:auto"><table>
+      <thead><tr><th>Vehicle</th><th>Fill Time</th><th>Qty</th><th>Current fill_type</th></tr></thead>
+      <tbody>
+        ${bad.map(e => {
+          const veh = state.vehicles.find(v=>v.id===e.vehicle_id);
+          return `<tr>
+            <td>${escapeHtml(veh ? (veh.reg_no||veh.name) : (e.vehicle_name||'—'))}</td>
+            <td>${e.fill_time ? new Date(e.fill_time).toLocaleString() : '—'}</td>
+            <td>${fmtNum(e.quantity)}</td>
+            <td>${escapeHtml(e.fill_type || '(blank)')}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <button class="btn primary small" style="margin-top:10px" onclick="confirmFixFillType()">✅ Mark these ${bad.length} as Full Tank</button>`;
+}
+
+let _badFillTypeEntries = [];
+function confirmFixFillType(){
+  if(!_badFillTypeEntries.length) return;
+  if(!confirm(`Mark ${_badFillTypeEntries.length} entries as Full Tank?`)) return;
+  _badFillTypeEntries.forEach(e => updateEntry(e.id, {fill_type:'full'}, 'Bulk fix'));
+  toast(`Marked ${_badFillTypeEntries.length} entries as Full Tank`, 'ok');
+  _badFillTypeEntries = [];
+  renderDash({auto:true});
+}
+window.scanBadFillType = scanBadFillType;
+window.confirmFixFillType = confirmFixFillType;
+
+function scanDuplicateEntries(){
+  const groups = {};
+  state.entries.forEach(e => {
+    if(!e.vehicle_id || !e.fill_time) return;
+    const sig = e.vehicle_id + '|' + e.fill_time.slice(0,16) + '|' + (parseFloat(e.quantity)||0).toFixed(2);
+    (groups[sig] = groups[sig] || []).push(e);
+  });
+  const dupGroups = Object.values(groups).filter(g => g.length > 1);
+  const toDelete = [];
+  dupGroups.forEach(g => {
+    const sorted = [...g].sort((a,b)=> new Date(a.created_at) - new Date(b.created_at));
+    toDelete.push(...sorted.slice(1)); // keep the oldest, mark rest for deletion
+  });
+  _dupEntriesToDelete = toDelete;
+  const el = $('#dup-scan-result');
+  if(!toDelete.length){
+    el.innerHTML = '<div style="color:var(--success);font-size:13px">No duplicates found.</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div style="font-size:13px;margin-bottom:8px;color:var(--danger)">
+      Found ${toDelete.length} duplicate entr${toDelete.length===1?'y':'ies'} across ${dupGroups.length} group(s).
+    </div>
+    <div class="table-wrap" style="max-height:220px;overflow:auto"><table>
+      <thead><tr><th>Vehicle</th><th>Fill Time</th><th>Qty</th><th>Manager</th><th>Created</th></tr></thead>
+      <tbody>
+        ${toDelete.map(e => {
+          const veh = state.vehicles.find(v=>v.id===e.vehicle_id);
+          return `<tr>
+            <td>${escapeHtml(veh ? (veh.reg_no||veh.name) : (e.vehicle_name||'—'))}</td>
+            <td>${e.fill_time ? new Date(e.fill_time).toLocaleString() : '—'}</td>
+            <td>${fmtNum(e.quantity)}</td>
+            <td>${escapeHtml(e.manager_name||'—')}</td>
+            <td>${e.created_at ? new Date(e.created_at).toLocaleString() : '—'}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <button class="btn danger small" style="margin-top:10px" onclick="confirmDeleteDuplicates()">🗑 Delete these ${toDelete.length} duplicates</button>`;
+}
+
+let _dupEntriesToDelete = [];
+function confirmDeleteDuplicates(){
+  if(!_dupEntriesToDelete.length) return;
+  if(!confirm(`Delete ${_dupEntriesToDelete.length} duplicate entries? This cannot be undone (originals are kept).`)) return;
+  _dupEntriesToDelete.forEach(e => deleteEntry(e.id));
+  toast(`Deleted ${_dupEntriesToDelete.length} duplicate entries`, 'ok');
+  _dupEntriesToDelete = [];
+  renderDash({auto:true});
+}
+window.scanDuplicateEntries = scanDuplicateEntries;
+window.confirmDeleteDuplicates = confirmDeleteDuplicates;
 
 function downloadBulkSample(kind){
   const t = BULK_TEMPLATES[kind];
@@ -6137,9 +6402,9 @@ function handleBulkParse(kind){
         ({headers, rows} = parseCSV(reader.result));
       }
     }catch(e){ toast('Could not parse file: '+e.message, 'err'); return; }
-    const {rows: validated, errCount} = validateBulkRows(kind, headers, rows);
+    const {rows: validated, errCount, dupCount} = validateBulkRows(kind, headers, rows);
     _bulkParsed[kind] = validated;
-    renderBulkPreview(kind, validated, errCount);
+    renderBulkPreview(kind, validated, errCount, dupCount);
   };
   reader.onerror = () => toast('Could not read file', 'err');
   if(isExcel) reader.readAsArrayBuffer(file); else reader.readAsText(file);
@@ -6147,10 +6412,19 @@ function handleBulkParse(kind){
 
 function validateBulkRows(kind, headers, rows){
   let errCount = 0;
+  let dupCount = 0;
+  const seenSignatures = new Set();
   const validated = rows.map((r, idx) => {
     const errors = [];
+    let isDuplicate = false;
     if(kind === 'vehicles'){
       if(!r.name && !r.reg_no) errors.push('name or reg_no required');
+      const sig = 'v:' + (r.reg_no||r.name||'').toLowerCase().trim();
+      const existsAlready = state.vehicles.some(v =>
+        (r.reg_no && (v.reg_no||'').toLowerCase() === r.reg_no.toLowerCase()) ||
+        (r.name && (v.name||'').toLowerCase() === r.name.toLowerCase()));
+      if(!errors.length && (existsAlready || seenSignatures.has(sig))) isDuplicate = true;
+      seenSignatures.add(sig);
     } else if(kind === 'managers'){
       const slot = parseInt(r.slot);
       if(!slot || slot < 1 || slot > 10) errors.push('slot must be 1-10');
@@ -6170,37 +6444,55 @@ function validateBulkRows(kind, headers, rows){
         if(!veh) errors.push('vehicle not found: '+r.vehicle);
         else r._vehicleId = veh.id;
       }
+      // Duplicate signature = same vehicle + same fill time (to the minute) + same quantity.
+      // Checked against both already-synced entries AND other rows earlier in this same file.
+      if(!errors.length){
+        const sig = 'e:'+r._vehicleId+'|'+r._parsedTime.slice(0,16)+'|'+qty.toFixed(2);
+        const existsAlready = state.entries.some(e =>
+          e.vehicle_id === r._vehicleId &&
+          (e.fill_time||'').slice(0,16) === r._parsedTime.slice(0,16) &&
+          Math.abs((parseFloat(e.quantity)||0) - qty) < 0.01);
+        if(existsAlready || seenSignatures.has(sig)) isDuplicate = true;
+        seenSignatures.add(sig);
+      }
     }
     if(errors.length) errCount++;
-    return {...r, _row: idx+2, _errors: errors};
+    else if(isDuplicate) dupCount++;
+    return {...r, _row: idx+2, _errors: errors, _duplicate: isDuplicate};
   });
-  return {rows: validated, errCount};
+  return {rows: validated, errCount, dupCount};
 }
 
-function renderBulkPreview(kind, rows, errCount){
+function renderBulkPreview(kind, rows, errCount, dupCount){
   const el = $('#bulk-preview-'+kind);
   if(!rows.length){ el.innerHTML = '<div class="empty" style="padding:12px">No rows found in file.</div>'; return; }
   const cols = Object.keys(rows[0]).filter(k => !k.startsWith('_'));
+  const validCount = rows.filter(r=>!r._errors.length && !r._duplicate).length;
   el.innerHTML = `
     <div style="font-size:12px;margin:8px 0">
-      ${rows.length} row(s) found — ${errCount ? `<span style="color:var(--danger)">${errCount} with errors (will be skipped)</span>` : `<span style="color:var(--success)">all valid</span>`}
+      ${rows.length} row(s) found —
+      ${errCount ? `<span style="color:var(--danger)">${errCount} with errors</span>, ` : ''}
+      ${dupCount ? `<span style="color:var(--warn)">${dupCount} duplicate(s)</span>, ` : ''}
+      <span style="color:var(--success)">${validCount} will be imported</span>
     </div>
     <div class="table-wrap" style="max-height:260px;overflow:auto"><table>
       <thead><tr>${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join('')}<th>Status</th></tr></thead>
       <tbody>
-        ${rows.map(r => `<tr style="${r._errors.length?'background:#fef2f2':''}">
+        ${rows.map(r => `<tr style="${r._errors.length?'background:#fef2f2':(r._duplicate?'background:#fffbeb':'')}">
           ${cols.map(c=>`<td>${escapeHtml(String(r[c]||''))}</td>`).join('')}
-          <td>${r._errors.length ? '<span style="color:var(--danger)">'+escapeHtml(r._errors.join('; '))+'</span>' : '<span style="color:var(--success)">OK</span>'}</td>
+          <td>${r._errors.length ? '<span style="color:var(--danger)">'+escapeHtml(r._errors.join('; '))+'</span>'
+              : r._duplicate ? '<span style="color:var(--warn)">Duplicate — will be skipped</span>'
+              : '<span style="color:var(--success)">OK</span>'}</td>
         </tr>`).join('')}
       </tbody>
     </table></div>
-    <button class="btn primary" style="margin-top:10px" onclick="handleBulkImport('${kind}')" ${rows.every(r=>r._errors.length) ? 'disabled':''}>
-      Import ${rows.filter(r=>!r._errors.length).length} valid row(s)
+    <button class="btn primary" style="margin-top:10px" onclick="handleBulkImport('${kind}')" ${validCount===0 ? 'disabled':''}>
+      Import ${validCount} valid row(s)
     </button>`;
 }
 
 function handleBulkImport(kind){
-  const rows = (_bulkParsed[kind] || []).filter(r => !r._errors.length);
+  const rows = (_bulkParsed[kind] || []).filter(r => !r._errors.length && !r._duplicate);
   if(!rows.length){ toast('No valid rows to import', 'err'); return; }
   if(!confirm(`Import ${rows.length} ${kind}? This writes directly to your company's data.`)) return;
 
@@ -6219,7 +6511,7 @@ function handleBulkImport(kind){
       hmr: r.hmr ? parseFloat(r.hmr) : null,
       quantity: parseFloat(r.quantity), fill_time: r._parsedTime,
       source: r.source || 'manual', source_custom:'', custom_data:{},
-      fill_type:'bulk_import', stock:null,
+      fill_type:'full', stock:null,
     }));
   }
   toast(`Imported ${rows.length} ${kind}`, 'ok');
@@ -7102,7 +7394,10 @@ function renderIncidentList(list, showManager, showActions){
             ${showManager && inc.manager_name ? `&nbsp;·&nbsp; <b>Reported by:</b> ${escapeHtml(inc.manager_name)}` : ''}
           </div>
           ${inc.notes ? `<div class="incident-notes">"${escapeHtml(inc.notes)}"</div>` : ''}
-          ${showActions ? `<div class="incident-actions"><button class="btn xs ghost" style="color:#dc2626" onclick="confirmDeleteIncident('${inc.id}')">🗑 Delete</button></div>` : ''}
+          ${showActions ? `<div class="incident-actions">
+            <button class="btn xs ghost" onclick="editIncidentModal('${inc.id}')">✎ Edit</button>
+            <button class="btn xs ghost" style="color:#dc2626" onclick="confirmDeleteIncident('${inc.id}')">🗑 Delete</button>
+          </div>` : ''}
         </div>
       `;
     }).join('')}
@@ -7113,6 +7408,48 @@ window.confirmDeleteIncident = function(id){
   deleteIncident(id);
   renderDash();
   toast('Incident deleted','ok');
+};
+window.editIncidentModal = function(id){
+  const inc = state.incidents.find(x => x.id === id); if(!inc) return;
+  const activeVehicles = state.vehicles.filter(v => v.active !== false)
+    .sort((a,b) => (a.reg_no||a.name||'').localeCompare(b.reg_no||b.name||''));
+  const activeLosses = state.losses.filter(l => l.active !== false)
+    .sort((a,b) => (a.sort_order||0) - (b.sort_order||0));
+  openModal('Edit Incident', `
+    <div class="form-row"><label>Driver Name *</label><input id="ei-driver" value="${escapeHtml(inc.driver_name||'')}"></div>
+    <div class="form-row"><label>Vehicle</label>
+      <select id="ei-vehicle">
+        <option value="">— none —</option>
+        ${activeVehicles.map(v=>`<option value="${v.id}" ${v.id===inc.vehicle_id?'selected':''}>${escapeHtml(v.reg_no||v.name)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row"><label>Loss Type *</label>
+      <select id="ei-loss">
+        ${activeLosses.map(l=>`<option value="${l.id}" ${l.id===inc.loss_id?'selected':''}>${escapeHtml(l.label)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row"><label>Incident Date *</label><input type="date" id="ei-date" value="${escapeHtml((inc.incident_date||'').slice(0,10))}"></div>
+    <div class="form-row"><label>Amount (₹)</label><input type="number" id="ei-amount" value="${inc.amount||0}" min="0" step="0.01"></div>
+    <div class="form-row"><label>Notes</label><textarea id="ei-notes" rows="3">${escapeHtml(inc.notes||'')}</textarea></div>
+    <button class="btn" style="width:100%" onclick="saveEditIncident('${id}')">Save</button>
+  `);
+};
+window.saveEditIncident = function(id){
+  const driver = $('#ei-driver').value.trim();
+  const lossId = $('#ei-loss').value;
+  const date = $('#ei-date').value;
+  if(!driver){ toast('Driver name required','err'); return; }
+  if(!lossId){ toast('Loss type required','err'); return; }
+  if(!date){ toast('Incident date required','err'); return; }
+  updateIncident(id, {
+    driver_name: driver,
+    vehicle_id: $('#ei-vehicle').value || null,
+    loss_id: lossId,
+    incident_date: date,
+    amount: parseFloat($('#ei-amount').value) || 0,
+    notes: $('#ei-notes').value.trim() || null,
+  });
+  closeModal(); renderDash(); toast('Incident updated','ok');
 };
 
 window.editEntryModal = function(id){
